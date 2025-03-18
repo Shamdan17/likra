@@ -21,9 +21,12 @@ from typing import Optional, Union
 from transformers.trainer_callback import TrainerCallback
 from mcprep_lib import DataCreationArguments, create_datasets
 
+
 def hydratrain():
     # global parser, trainer_args, training_args, lora_args, unknown_args, trainer, lora_config #DBG
-    parser = HfArgumentParser((TrainerArguments, DataCreationArguments, TrainingArguments, LoraArguments))
+    parser = HfArgumentParser(
+        (TrainerArguments, DataCreationArguments, TrainingArguments, LoraArguments)
+    )
     trainer_args, datacreation_args, training_args, lora_args, unknown_args = (
         parser.parse_args_into_dataclasses(return_remaining_strings=True)
     )
@@ -179,9 +182,9 @@ def hydratrain():
             print(trainer.evaluate())
             trainer.eval_dataset = _save
 
-
     def saver(otdr=None, _internal_call=None):
         hydrasave(trainer, important_args)
+
     trainer.save_model = saver
     # eval2()
 
@@ -422,7 +425,9 @@ def to_dict(
     return dict((field.name, getattr(obj, field.name)) for field in fields(obj))
 
 
-def hydrasave(trainer, important_args, output_dir=None, adapter_to_save=None, _internal_call=None):
+def hydrasave(
+    trainer, important_args, output_dir=None, adapter_to_save=None, _internal_call=None
+):
     if output_dir is None:
         output_dir = trainer.args.output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -502,11 +507,13 @@ class HydraLoraConfig(PretrainedConfig):
 # added HYDRA_ADAPTER_WEIGHTS environment variable to override the weights in config.json
 
 modeling_hydra_lora_py = """import os
+import os
 import torch
 from transformers import AutoModelForCausalLM, PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from torch.nn.functional import log_softmax
 from .configuration_hydra_lora import HydraLoraConfig
+
 
 class HydraLoraForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = HydraLoraConfig
@@ -516,30 +523,109 @@ class HydraLoraForCausalLM(PreTrainedModel, GenerationMixin):
 
     @classmethod
     def from_pretrained(cls, path, *args, **kwargs):
-        config = kwargs.pop('config')
+        config = kwargs.pop("config")
         hydra = cls(config)
+        if kwargs.get("hydra_adapter_weights", None) is not None:
+            hydra.config.adapter_weights = kwargs.pop("hydra_adapter_weights")
+        elif "HYDRA_ADAPTER_WEIGHTS" in os.environ:
+            hydra.config.adapter_weights = [
+                float(x) for x in os.environ["HYDRA_ADAPTER_WEIGHTS"].split(",")
+            ]
+        if kwargs.get("hydra_adapter_names", None) is not None:
+            hydra.config.adapter_names = kwargs.pop("hydra_adapter_names")
+        elif "HYDRA_ADAPTER_NAMES" in os.environ:
+            hydra.config.adapter_names = os.environ["HYDRA_ADAPTER_NAMES"].split(",")
+
+        if kwargs.get("hydra_mode", None) is not None:
+            hydra.config.mode = kwargs.pop("hydra_mode")
+        elif (
+            "HYDRA_MODE" in os.environ
+        ):  # Options: default, pos_only, neg_only, pos_base
+            hydra.config.mode = os.environ["HYDRA_MODE"]
+        else:
+            hydra.config.mode = "default"
+
         for adapter_name in config.adapter_names:
             adapter_path = os.path.join(config._name_or_path, adapter_name)
-            if hasattr(hydra, 'model'):
+            if hasattr(hydra, "model"):
                 hydra.model.load_adapter(adapter_path, adapter_name=adapter_name)
             else:
-                hydra.model = AutoModelForCausalLM.from_pretrained(adapter_path, *args, **kwargs, adapter_name=adapter_name)
-        hydra.hf_device_map = hydra.model.hf_device_map # need this for lm_eval
-        if 'HYDRA_ADAPTER_WEIGHTS' in os.environ:
-            hydra.config.adapter_weights = [ float(x) for x in os.environ['HYDRA_ADAPTER_WEIGHTS'].split(',') ]
+                hydra.model = AutoModelForCausalLM.from_pretrained(
+                    adapter_path, *args, **kwargs, adapter_name=adapter_name
+                )
+
+        hydra.hf_device_map = hydra.model.hf_device_map  # need this for lm_eval
+
         return hydra
 
     def forward(self, *args, **kwargs):
         logits = None
-        for adapter, weight in zip(self.config.adapter_names, self.config.adapter_weights):
+        adapter_names = []
+        adapter_weights = []
+
+        if self.config.mode == "pos_only":
+            adapter_names = []
+            adapter_weights = []
+            for adapter, weight in zip(
+                self.config.adapter_names, self.config.adapter_weights
+            ):
+                if weight > 0:
+                    adapter_names.append(adapter)
+                    adapter_weights.append(weight)
+        elif self.config.mode == "neg_only":
+            for adapter, weight in zip(
+                self.config.adapter_names, self.config.adapter_weights
+            ):
+                if weight > 0:
+                    adapter_names.append(None)
+                    adapter_weights.append(weight)
+                elif weight < 0:
+                    adapter_names.append(adapter)
+                    adapter_weights.append(weight)
+        elif self.config.mode == "pos_base":
+            for adapter, weight in zip(
+                self.config.adapter_names, self.config.adapter_weights
+            ):
+                if weight > 0:
+                    adapter_names.append(adapter)
+                    adapter_weights.append(weight)
+                else:
+                    adapter_names.append(None)
+                    adapter_weights.append(weight)
+        else:
+            adapter_names = self.config.adapter_names
+            adapter_weights = self.config.adapter_weights
+
+        for adapter, weight in zip(adapter_names, adapter_weights):
+            if weight == 0:
+                continue
             with torch.no_grad():
-                self.model.set_adapter(adapter)
+                if adapter is None:
+                    self.model.disable_adapters()
+                else:
+                    self.model.enable_adapters()
+                    self.model.set_adapter(adapter)
                 logp = log_softmax(self.model.forward(*args, **kwargs).logits, dim=-1)
             logits = logits + weight * logp if logits is not None else weight * logp
+
+        # exit(0)
         return CausalLMOutputWithPast(logits=logits)
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs):
-        return self.model.prepare_inputs_for_generation(input_ids, past_key_values=past_key_values, attention_mask=attention_mask, inputs_embeds=inputs_embeds, **kwargs)
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        **kwargs
+    ):
+        return self.model.prepare_inputs_for_generation(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            **kwargs
+        )
 """
 
 
